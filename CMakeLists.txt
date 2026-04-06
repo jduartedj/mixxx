@@ -2809,6 +2809,25 @@ if(FFMPEG)
   target_include_directories(mixxx-lib PUBLIC "${FFMPEG_INCLUDE_DIRS}")
 endif()
 
+
+# Spotify streaming support via librespot
+option(SPOTIFY "Spotify streaming support via librespot (personal use)" OFF)
+if(SPOTIFY)
+  target_sources(
+    mixxx-lib
+    PRIVATE
+      src/sources/soundsourcespotify.cpp
+      src/spotify/spotifyprocess.cpp
+      src/spotify/spotifyapiclient.cpp
+      src/spotify/spotifyfeature.cpp
+  )
+  target_compile_definitions(
+    mixxx-lib
+    PUBLIC
+      __SPOTIFY__
+  )
+  message(STATUS "Spotify support: enabled (via librespot pipe backend)")
+endif()
 # STEM file support
 default_option(STEM "STEM file support" "FFMPEG_FOUND;FFMPEG")
 if(STEM)

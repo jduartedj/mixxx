@@ -39,6 +39,9 @@
 #ifdef __STEM__
 #include "sources/soundsourcestem.h"
 #endif
+#ifdef __SPOTIFY__
+#include "sources/soundsourcespotify.h"
+#endif
 
 #include "library/coverartutils.h"
 #include "track/globaltrackcache.h"
@@ -240,6 +243,11 @@ bool SoundSourceProxy::registerProviders() {
     registerSoundSourceProvider(
             &s_soundSourceProviders,
             std::make_shared<mixxx::SoundSourceProviderSTEM>());
+#endif
+#ifdef __SPOTIFY__
+    registerSoundSourceProvider(
+            &s_soundSourceProviders,
+            std::make_shared<mixxx::SoundSourceProviderSpotify>());
 #endif
     // Register the high-priority reference providers AFTER all other
     // providers to verify that their priorities are correct.
