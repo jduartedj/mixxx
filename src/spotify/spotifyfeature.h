@@ -24,7 +24,7 @@ class SpotifyFeature : public LibraryFeature {
 
     QVariant title() override;
     bool dropAccept(const QList<QUrl>& urls, QObject* pSource) override;
-    bool dragMoveAccept(const QUrl& url) override;
+    bool dragMoveAccept(const QList<QUrl>& urls) override;
     void bindLibraryWidget(WLibrary* libraryWidget,
             KeyboardEventFilter* keyboard) override;
     void bindSidebarWidget(WLibrarySidebar* pSidebarWidget) override;

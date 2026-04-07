@@ -65,8 +65,8 @@ bool SpotifyFeature::dropAccept(const QList<QUrl>& urls, QObject* pSource) {
     return false;
 }
 
-bool SpotifyFeature::dragMoveAccept(const QUrl& url) {
-    Q_UNUSED(url)
+bool SpotifyFeature::dragMoveAccept(const QList<QUrl>& urls) {
+    Q_UNUSED(urls)
     return false;
 }
 
