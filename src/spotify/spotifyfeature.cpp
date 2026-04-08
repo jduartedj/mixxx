@@ -3,11 +3,20 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QInputDialog>
+#include <QLineEdit>
 #include <QMessageBox>
+#include <QSqlQuery>
 #include <QStandardPaths>
 #include <QtDebug>
 
+#include "library/baseexternalplaylistmodel.h"
+#include "library/baseexternaltrackmodel.h"
+#include "library/basetrackcache.h"
+#include "library/dao/trackschema.h"
 #include "library/library.h"
+#include "library/queryutil.h"
+#include "library/trackcollection.h"
+#include "library/trackcollectionmanager.h"
 #include "library/treeitem.h"
 
 namespace mixxx {
@@ -15,12 +24,20 @@ namespace mixxx {
 const QString SpotifyFeature::kPlaylistsNode = QStringLiteral("Playlists");
 const QString SpotifyFeature::kSavedTracksNode = QStringLiteral("Saved Tracks");
 const QString SpotifyFeature::kSearchNode = QStringLiteral("Search");
+const QString SpotifyFeature::kSpotifyLibraryTable = QStringLiteral("spotify_library");
+const QString SpotifyFeature::kSpotifyPlaylistsTable = QStringLiteral("spotify_playlists");
+const QString SpotifyFeature::kSpotifyPlaylistTracksTable = QStringLiteral("spotify_playlist_tracks");
 
 SpotifyFeature::SpotifyFeature(Library* pLibrary, UserSettingsPointer pConfig)
-        : LibraryFeature(pLibrary, pConfig, QStringLiteral("spotify")),
+        : BaseExternalLibraryFeature(pLibrary, pConfig, QStringLiteral("spotify")),
           m_pApiClient(std::make_unique<SpotifyApiClient>()),
           m_pTokenServerProcess(nullptr),
-          m_pSidebarModel(nullptr) {
+          m_pSidebarModel(nullptr),
+          m_pTrackModel(nullptr),
+          m_pPlaylistModel(nullptr),
+          m_currentPlaylistId(-1),
+          m_isActivated(false),
+          m_nextPlaylistId(1) {
     // Start the token server automatically
     startTokenServer();
 
@@ -42,11 +59,68 @@ SpotifyFeature::SpotifyFeature(Library* pLibrary, UserSettingsPointer pConfig)
             this,
             &SpotifyFeature::onApiError);
 
+    // Create SQL tables
+    createDbTables();
+
+    // Set up track cache and models
+    QString tableName = kSpotifyLibraryTable;
+    QString idColumn = LIBRARYTABLE_ID;
+    QStringList columns = {
+            LIBRARYTABLE_ID,
+            LIBRARYTABLE_ARTIST,
+            LIBRARYTABLE_TITLE,
+            LIBRARYTABLE_ALBUM,
+            LIBRARYTABLE_YEAR,
+            LIBRARYTABLE_GENRE,
+            LIBRARYTABLE_TRACKNUMBER,
+            TRACKLOCATIONSTABLE_LOCATION,
+            LIBRARYTABLE_COMMENT,
+            LIBRARYTABLE_RATING,
+            LIBRARYTABLE_DURATION,
+            LIBRARYTABLE_BITRATE,
+            LIBRARYTABLE_BPM,
+            LIBRARYTABLE_KEY,
+    };
+    QStringList searchColumns = {
+            LIBRARYTABLE_ARTIST,
+            LIBRARYTABLE_TITLE,
+            LIBRARYTABLE_ALBUM,
+            LIBRARYTABLE_GENRE,
+    };
+
+    m_trackSource = QSharedPointer<BaseTrackCache>::create(
+            m_pTrackCollection,
+            tableName,
+            idColumn,
+            columns,
+            searchColumns,
+            false);
+
+    m_pTrackModel = new BaseExternalTrackModel(this,
+            pLibrary->trackCollectionManager(),
+            "mixxx.db.model.spotify",
+            kSpotifyLibraryTable,
+            m_trackSource);
+
+    m_pPlaylistModel = new BaseExternalPlaylistModel(this,
+            pLibrary->trackCollectionManager(),
+            "mixxx.db.model.spotify_playlist",
+            kSpotifyPlaylistsTable,
+            kSpotifyPlaylistTracksTable,
+            m_trackSource);
+
     buildSidebarModel();
 }
 
 SpotifyFeature::~SpotifyFeature() {
+    if (m_pTrackModel) {
+        delete m_pTrackModel;
+    }
+    if (m_pPlaylistModel) {
+        delete m_pPlaylistModel;
+    }
     stopTokenServer();
+    dropDbTables();
 }
 
 /*static*/ bool SpotifyFeature::isSupported() {
@@ -86,19 +160,6 @@ bool SpotifyFeature::dragMoveAccept(const QList<QUrl>& urls) {
     return false;
 }
 
-void SpotifyFeature::bindLibraryWidget(
-        WLibrary* libraryWidget,
-        KeyboardEventFilter* keyboard) {
-    Q_UNUSED(libraryWidget)
-    Q_UNUSED(keyboard)
-    // TODO: Create a custom widget for displaying Spotify tracks
-    // For now, we'll use the default table view
-}
-
-void SpotifyFeature::bindSidebarWidget(WLibrarySidebar* pSidebarWidget) {
-    Q_UNUSED(pSidebarWidget)
-}
-
 TreeItemModel* SpotifyFeature::sidebarModel() const {
     return m_pSidebarModel;
 }
@@ -116,8 +177,14 @@ void SpotifyFeature::buildSidebarModel() {
 
 void SpotifyFeature::activate() {
     qDebug() << "SpotifyFeature: Activated";
+    if (!m_isActivated) {
+        clearDbTables();
+        m_isActivated = true;
+    }
+    m_currentPlaylistId = -1; // Show all tracks
     loadPlaylists();
-    emit switchToView(QStringLiteral("spotify"));
+    m_pTrackModel->setSearch("");
+    emit showTrackModel(m_pTrackModel);
     emit enableCoverArtDisplay(false);
 }
 
@@ -136,8 +203,14 @@ void SpotifyFeature::activateChild(const QModelIndex& index) {
 
     if (itemName == kPlaylistsNode) {
         loadPlaylists();
+        m_currentPlaylistId = -1;
+        m_pTrackModel->setSearch("");
+        emit showTrackModel(m_pTrackModel);
     } else if (itemName == kSavedTracksNode) {
+        clearDbTables();
         m_pApiClient->fetchSavedTracks();
+        m_currentPlaylistId = -1;
+        emit showTrackModel(m_pTrackModel);
     } else if (itemName == kSearchNode) {
         bool ok;
         QString query = QInputDialog::getText(
@@ -148,7 +221,9 @@ void SpotifyFeature::activateChild(const QModelIndex& index) {
                 QString(),
                 &ok);
         if (ok && !query.isEmpty()) {
+            clearDbTables();
             m_pApiClient->searchTracks(query);
+            emit showTrackModel(m_pTrackModel);
         }
     } else {
         // It's a playlist name — find it and load tracks
@@ -156,6 +231,12 @@ void SpotifyFeature::activateChild(const QModelIndex& index) {
             QJsonObject obj = pl.toObject();
             if (obj.value(QStringLiteral("name")).toString() == itemName) {
                 QString playlistId = obj.value(QStringLiteral("id")).toString();
+                int dbPlaylistId = m_playlistDbIds.value(itemName, -1);
+                if (dbPlaylistId > 0) {
+                    m_currentPlaylistId = dbPlaylistId;
+                    m_pPlaylistModel->setPlaylistById(dbPlaylistId);
+                    emit showTrackModel(m_pPlaylistModel);
+                }
                 m_pApiClient->fetchPlaylistTracks(playlistId);
                 break;
             }
@@ -167,9 +248,7 @@ void SpotifyFeature::onRightClick(const QPoint& globalPos) {
     Q_UNUSED(globalPos)
 }
 
-void SpotifyFeature::onRightClickChild(
-        const QPoint& globalPos,
-        const QModelIndex& index) {
+void SpotifyFeature::onRightClickChild(const QPoint& globalPos, const QModelIndex& index) {
     Q_UNUSED(globalPos)
     Q_UNUSED(index)
 }
@@ -185,6 +264,8 @@ void SpotifyFeature::onPlaylistsReceived(const QJsonArray& playlists) {
     auto pRootItem = TreeItem::newRoot(this);
 
     auto* pPlaylistsItem = pRootItem->appendChild(kPlaylistsNode);
+    m_nextPlaylistId = 1;
+    m_playlistDbIds.clear();
     for (const auto& pl : playlists) {
         QJsonObject obj = pl.toObject();
         QString name = obj.value(QStringLiteral("name")).toString();
@@ -192,6 +273,10 @@ void SpotifyFeature::onPlaylistsReceived(const QJsonArray& playlists) {
                                  .toObject()
                                  .value(QStringLiteral("total"))
                                  .toInt();
+        insertPlaylistIntoDb(m_nextPlaylistId, name);
+        m_playlistDbIds[name] = m_nextPlaylistId;
+        m_nextPlaylistId++;
+
         pPlaylistsItem->appendChild(
                 QStringLiteral("%1 (%2)").arg(name).arg(trackCount));
     }
@@ -207,6 +292,9 @@ void SpotifyFeature::onPlaylistsReceived(const QJsonArray& playlists) {
 void SpotifyFeature::onTracksReceived(const QJsonArray& tracks) {
     m_currentTracks = tracks;
 
+    // Insert tracks into DB
+    insertTracksIntoDb(tracks);
+
     // Fetch audio features for all tracks
     QStringList trackIds;
     for (const auto& track : tracks) {
@@ -221,29 +309,21 @@ void SpotifyFeature::onTracksReceived(const QJsonArray& tracks) {
         m_pApiClient->fetchAudioFeatures(trackIds);
     }
 
-    qDebug() << "SpotifyFeature: Received" << tracks.size() << "tracks";
-
-    // TODO: Display tracks in the library table
-    // For now, log them
-    for (const auto& track : tracks) {
-        QJsonObject obj = track.toObject();
-        QString name = obj.value(QStringLiteral("name")).toString();
-        QJsonArray artists = obj.value(QStringLiteral("artists")).toArray();
-        QString artist;
-        if (!artists.isEmpty()) {
-            artist = artists.first()
-                             .toObject()
-                             .value(QStringLiteral("name"))
-                             .toString();
-        }
-        int durationMs = obj.value(QStringLiteral("duration_ms")).toInt();
-        QString uri = obj.value(QStringLiteral("uri")).toString();
-        qDebug() << "  Track:" << artist << "-" << name
-                  << "(" << (durationMs / 1000) << "s)" << uri;
+    // Rebuild the track model
+    m_trackSource->buildIndex();
+    m_pTrackModel->setSearch("");
+    if (m_currentPlaylistId > 0) {
+        m_pPlaylistModel->setPlaylistById(m_currentPlaylistId);
+        emit showTrackModel(m_pPlaylistModel);
+    } else {
+        emit showTrackModel(m_pTrackModel);
     }
+
+    qDebug() << "SpotifyFeature: Received" << tracks.size() << "tracks";
 }
 
 void SpotifyFeature::onAudioFeaturesReceived(const QJsonArray& features) {
+    updateAudioFeaturesInDb(features);
     for (const auto& feat : features) {
         QJsonObject obj = feat.toObject();
         if (obj.isEmpty()) {
@@ -358,6 +438,276 @@ void SpotifyFeature::stopTokenServer() {
         }
         delete m_pTokenServerProcess;
         m_pTokenServerProcess = nullptr;
+    }
+}
+
+void SpotifyFeature::createDbTables() {
+    QSqlDatabase database = m_pTrackCollection->database();
+
+    qDebug() << "SpotifyFeature: Creating Spotify library tables";
+
+    QSqlQuery query(database);
+
+    // Create spotify_library table
+    query.prepare(
+            "CREATE TABLE IF NOT EXISTS " + kSpotifyLibraryTable +
+            " ("
+            "    id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "    artist TEXT,"
+            "    title TEXT,"
+            "    album TEXT,"
+            "    album_artist TEXT DEFAULT '',"
+            "    year INTEGER,"
+            "    genre TEXT,"
+            "    tracknumber TEXT,"
+            "    location TEXT UNIQUE,"
+            "    comment TEXT,"
+            "    duration INTEGER,"
+            "    bitrate TEXT,"
+            "    bpm FLOAT,"
+            "    key TEXT,"
+            "    rating INTEGER"
+            ");");
+
+    if (!query.exec()) {
+        LOG_FAILED_QUERY(query);
+        qWarning() << "SpotifyFeature: Failed to create spotify_library table";
+    }
+
+    // Create spotify_playlists table
+    query.prepare(
+            "CREATE TABLE IF NOT EXISTS " + kSpotifyPlaylistsTable +
+            " ("
+            "    id INTEGER PRIMARY KEY,"
+            "    name TEXT UNIQUE"
+            ");");
+
+    if (!query.exec()) {
+        LOG_FAILED_QUERY(query);
+        qWarning() << "SpotifyFeature: Failed to create spotify_playlists table";
+    }
+
+    // Create spotify_playlist_tracks table
+    query.prepare(
+            "CREATE TABLE IF NOT EXISTS " + kSpotifyPlaylistTracksTable +
+            " ("
+            "    id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "    playlist_id INTEGER REFERENCES spotify_playlists(id),"
+            "    track_id INTEGER REFERENCES spotify_library(id),"
+            "    position INTEGER"
+            ");");
+
+    if (!query.exec()) {
+        LOG_FAILED_QUERY(query);
+        qWarning() << "SpotifyFeature: Failed to create spotify_playlist_tracks table";
+    }
+}
+
+void SpotifyFeature::dropDbTables() {
+    QSqlDatabase database = m_pTrackCollection->database();
+    QSqlQuery query(database);
+
+    qDebug() << "SpotifyFeature: Dropping Spotify library tables";
+
+    query.prepare("DROP TABLE IF EXISTS " + kSpotifyPlaylistTracksTable);
+    if (!query.exec()) {
+        LOG_FAILED_QUERY(query);
+    }
+
+    query.prepare("DROP TABLE IF EXISTS " + kSpotifyPlaylistsTable);
+    if (!query.exec()) {
+        LOG_FAILED_QUERY(query);
+    }
+
+    query.prepare("DROP TABLE IF EXISTS " + kSpotifyLibraryTable);
+    if (!query.exec()) {
+        LOG_FAILED_QUERY(query);
+    }
+}
+
+void SpotifyFeature::clearDbTables() {
+    QSqlDatabase database = m_pTrackCollection->database();
+    QSqlQuery query(database);
+
+    qDebug() << "SpotifyFeature: Clearing Spotify library tables";
+
+    query.prepare("DELETE FROM " + kSpotifyPlaylistTracksTable);
+    if (!query.exec()) {
+        LOG_FAILED_QUERY(query);
+    }
+
+    query.prepare("DELETE FROM " + kSpotifyPlaylistsTable);
+    if (!query.exec()) {
+        LOG_FAILED_QUERY(query);
+    }
+
+    query.prepare("DELETE FROM " + kSpotifyLibraryTable);
+    if (!query.exec()) {
+        LOG_FAILED_QUERY(query);
+    }
+}
+
+void SpotifyFeature::insertTracksIntoDb(const QJsonArray& tracks) {
+    QSqlDatabase database = m_pTrackCollection->database();
+    QSqlQuery query(database);
+
+    query.prepare(
+            "INSERT OR REPLACE INTO " + kSpotifyLibraryTable +
+            " (artist, title, album, year, genre, tracknumber, location, "
+            "comment, duration, bitrate, bpm, key, rating) "
+            "VALUES (:artist, :title, :album, :year, :genre, :tracknumber, "
+            ":location, :comment, :duration, :bitrate, :bpm, :key, :rating)");
+
+    int trackId = 1;
+    for (const auto& track : tracks) {
+        QJsonObject obj = track.toObject();
+
+        QString artist;
+        QJsonArray artists = obj.value(QStringLiteral("artists")).toArray();
+        if (!artists.isEmpty()) {
+            artist = artists.first()
+                             .toObject()
+                             .value(QStringLiteral("name"))
+                             .toString();
+        }
+
+        QString title = obj.value(QStringLiteral("name")).toString();
+        QString album = obj.value(QStringLiteral("album"))
+                                .toObject()
+                                .value(QStringLiteral("name"))
+                                .toString();
+        int durationMs = obj.value(QStringLiteral("duration_ms")).toInt();
+        QString uri = obj.value(QStringLiteral("uri")).toString();
+
+        query.bindValue(":artist", artist);
+        query.bindValue(":title", title);
+        query.bindValue(":album", album);
+        query.bindValue(":year", 0);
+        query.bindValue(":genre", QString());
+        query.bindValue(":tracknumber", QString());
+        query.bindValue(":location", uri);
+        query.bindValue(":comment", QString());
+        query.bindValue(":duration", durationMs / 1000); // Convert to seconds
+        query.bindValue(":bitrate", QString());
+        query.bindValue(":bpm", 0.0);
+        query.bindValue(":key", QString());
+        query.bindValue(":rating", 0);
+
+        if (!query.exec()) {
+            LOG_FAILED_QUERY(query);
+            qWarning() << "SpotifyFeature: Failed to insert track:" << title;
+        }
+        trackId++;
+    }
+
+    qDebug() << "SpotifyFeature: Inserted" << tracks.size() << "tracks into database";
+}
+
+void SpotifyFeature::insertPlaylistIntoDb(int playlistId, const QString& name) {
+    QSqlDatabase database = m_pTrackCollection->database();
+    QSqlQuery query(database);
+
+    query.prepare(
+            "INSERT OR REPLACE INTO " + kSpotifyPlaylistsTable +
+            " (id, name) VALUES (:id, :name)");
+
+    query.bindValue(":id", playlistId);
+    query.bindValue(":name", name);
+
+    if (!query.exec()) {
+        LOG_FAILED_QUERY(query);
+        qWarning() << "SpotifyFeature: Failed to insert playlist:" << name;
+    }
+}
+
+void SpotifyFeature::insertPlaylistTracksIntoDb(int playlistId, const QJsonArray& tracks) {
+    QSqlDatabase database = m_pTrackCollection->database();
+    QSqlQuery query(database);
+
+    query.prepare(
+            "INSERT INTO " + kSpotifyPlaylistTracksTable +
+            " (playlist_id, track_id, position) "
+            "VALUES (:playlist_id, :track_id, :position)");
+
+    // First, get the track IDs from the library table by matching artist + title
+    QSqlQuery selectQuery(database);
+
+    int position = 0;
+    for (const auto& track : tracks) {
+        QJsonObject obj = track.toObject();
+        QString uri = obj.value(QStringLiteral("uri")).toString();
+
+        // Find the track ID by URI
+        selectQuery.prepare(
+                "SELECT id FROM " + kSpotifyLibraryTable +
+                " WHERE location = :location");
+        selectQuery.bindValue(":location", uri);
+
+        if (!selectQuery.exec()) {
+            LOG_FAILED_QUERY(selectQuery);
+            continue;
+        }
+
+        if (selectQuery.next()) {
+            int trackId = selectQuery.value(0).toInt();
+
+            query.bindValue(":playlist_id", playlistId);
+            query.bindValue(":track_id", trackId);
+            query.bindValue(":position", position);
+
+            if (!query.exec()) {
+                LOG_FAILED_QUERY(query);
+            }
+            position++;
+        }
+    }
+
+    qDebug() << "SpotifyFeature: Inserted" << tracks.size()
+             << "playlist tracks into database";
+}
+
+void SpotifyFeature::updateAudioFeaturesInDb(const QJsonArray& features) {
+    QSqlDatabase database = m_pTrackCollection->database();
+    QSqlQuery query(database);
+
+    query.prepare(
+            "UPDATE " + kSpotifyLibraryTable +
+            " SET bpm = :bpm, key = :key WHERE location = :location");
+
+    for (const auto& feat : features) {
+        QJsonObject obj = feat.toObject();
+        if (obj.isEmpty()) {
+            continue;
+        }
+
+        QString id = obj.value(QStringLiteral("id")).toString();
+        double tempo = obj.value(QStringLiteral("tempo")).toDouble();
+        int key = obj.value(QStringLiteral("key")).toInt(-1);
+        int mode = obj.value(QStringLiteral("mode")).toInt(-1);
+        QString camelot = SpotifyApiClient::toCamelotKey(key, mode);
+
+        // Find track by ID and update BPM/key
+        QSqlQuery findQuery(database);
+        findQuery.prepare(
+                "SELECT location FROM " + kSpotifyLibraryTable +
+                " WHERE location LIKE :id");
+        findQuery.bindValue(":id", "%:track:" + id);
+
+        if (!findQuery.exec()) {
+            continue;
+        }
+
+        while (findQuery.next()) {
+            QString location = findQuery.value(0).toString();
+
+            query.bindValue(":bpm", tempo);
+            query.bindValue(":key", camelot);
+            query.bindValue(":location", location);
+
+            if (!query.exec()) {
+                LOG_FAILED_QUERY(query);
+            }
+        }
     }
 }
 
