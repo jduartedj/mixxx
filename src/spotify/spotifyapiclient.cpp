@@ -8,7 +8,7 @@
 namespace mixxx {
 
 const QString SpotifyApiClient::kTokenServerUrl =
-        QStringLiteral("http://localhost:37353/api/getToken");
+        QStringLiteral("http://127.0.0.1:37353/api/getToken");
 const QString SpotifyApiClient::kSpotifyApiBase =
         QStringLiteral("https://api.spotify.com/v1");
 const int SpotifyApiClient::kMaxRequestsPerMinute = 170; // Leave some headroom

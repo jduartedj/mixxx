@@ -1,8 +1,10 @@
 #include "spotify/spotifyfeature.h"
 
 #include <QCoreApplication>
+#include <QDir>
 #include <QInputDialog>
 #include <QMessageBox>
+#include <QStandardPaths>
 #include <QtDebug>
 
 #include "library/library.h"
@@ -17,7 +19,11 @@ const QString SpotifyFeature::kSearchNode = QStringLiteral("Search");
 SpotifyFeature::SpotifyFeature(Library* pLibrary, UserSettingsPointer pConfig)
         : LibraryFeature(pLibrary, pConfig, QStringLiteral("spotify")),
           m_pApiClient(std::make_unique<SpotifyApiClient>()),
+          m_pTokenServerProcess(nullptr),
           m_pSidebarModel(nullptr) {
+    // Start the token server automatically
+    startTokenServer();
+
     // Connect API signals
     connect(m_pApiClient.get(),
             &SpotifyApiClient::playlistsReceived,
@@ -39,7 +45,9 @@ SpotifyFeature::SpotifyFeature(Library* pLibrary, UserSettingsPointer pConfig)
     buildSidebarModel();
 }
 
-SpotifyFeature::~SpotifyFeature() = default;
+SpotifyFeature::~SpotifyFeature() {
+    stopTokenServer();
+}
 
 /*static*/ bool SpotifyFeature::isSupported() {
     // Check if token server is likely running (we can't block here to test)
@@ -260,6 +268,97 @@ void SpotifyFeature::onAudioFeaturesReceived(const QJsonArray& features) {
 
 void SpotifyFeature::onApiError(const QString& message) {
     qWarning() << "SpotifyFeature: API error:" << message;
+}
+
+QString SpotifyFeature::findTokenServerPath() const {
+    QStringList paths = {
+#ifdef _WIN32
+            QDir::homePath() + QStringLiteral("/spotify-token-generator/index.js"),
+            QCoreApplication::applicationDirPath() + QStringLiteral("/spotify-token-generator/index.js"),
+#else
+            QDir::homePath() + QStringLiteral("/spotify-token-generator/index.js"),
+            QStringLiteral("/opt/spotify-token-generator/index.js"),
+#endif
+    };
+    for (const auto& path : paths) {
+        if (QFile::exists(path)) {
+            return path;
+        }
+    }
+    return QString();
+}
+
+void SpotifyFeature::startTokenServer() {
+    if (m_pTokenServerProcess &&
+            m_pTokenServerProcess->state() != QProcess::NotRunning) {
+        qDebug() << "SpotifyFeature: Token server already running";
+        return;
+    }
+
+    QString serverPath = findTokenServerPath();
+    if (serverPath.isEmpty()) {
+        qWarning() << "SpotifyFeature: Token server index.js not found";
+        return;
+    }
+
+    m_pTokenServerProcess = new QProcess(this);
+    m_pTokenServerProcess->setWorkingDirectory(
+            QFileInfo(serverPath).absolutePath());
+
+    connect(m_pTokenServerProcess,
+            QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+            this,
+            [this](int exitCode, QProcess::ExitStatus status) {
+                qWarning() << "SpotifyFeature: Token server exited"
+                           << "code:" << exitCode << "status:" << status;
+            });
+
+    // Find node executable
+    QString nodeBin = QStandardPaths::findExecutable(QStringLiteral("node"));
+    if (nodeBin.isEmpty()) {
+#ifdef _WIN32
+        // Fallback: check common Windows locations
+        QStringList nodePaths = {
+                QStringLiteral("C:/nvm4w/nodejs/node.exe"),
+                QDir::homePath() + QStringLiteral("/AppData/Local/nvm/v22.20.0/node.exe"),
+        };
+        for (const auto& p : nodePaths) {
+            if (QFile::exists(p)) {
+                nodeBin = p;
+                break;
+            }
+        }
+#endif
+    }
+    if (nodeBin.isEmpty()) {
+        qWarning() << "SpotifyFeature: node executable not found, cannot start token server";
+        return;
+    }
+
+    qDebug() << "SpotifyFeature: Starting token server:" << nodeBin << serverPath;
+    m_pTokenServerProcess->start(nodeBin, {serverPath});
+
+    if (!m_pTokenServerProcess->waitForStarted(5000)) {
+        qWarning() << "SpotifyFeature: Failed to start token server";
+        delete m_pTokenServerProcess;
+        m_pTokenServerProcess = nullptr;
+    } else {
+        qDebug() << "SpotifyFeature: Token server started, PID:"
+                 << m_pTokenServerProcess->processId();
+    }
+}
+
+void SpotifyFeature::stopTokenServer() {
+    if (m_pTokenServerProcess) {
+        if (m_pTokenServerProcess->state() != QProcess::NotRunning) {
+            m_pTokenServerProcess->terminate();
+            if (!m_pTokenServerProcess->waitForFinished(3000)) {
+                m_pTokenServerProcess->kill();
+            }
+        }
+        delete m_pTokenServerProcess;
+        m_pTokenServerProcess = nullptr;
+    }
 }
 
 } // namespace mixxx

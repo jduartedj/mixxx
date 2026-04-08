@@ -6,6 +6,7 @@
 
 #include <QAction>
 #include <QJsonArray>
+#include <QProcess>
 #include <QStandardItemModel>
 #include <memory>
 
@@ -49,8 +50,12 @@ class SpotifyFeature : public LibraryFeature {
   private:
     void buildSidebarModel();
     void loadPlaylists();
+    void startTokenServer();
+    void stopTokenServer();
+    QString findTokenServerPath() const;
 
     std::unique_ptr<SpotifyApiClient> m_pApiClient;
+    QProcess* m_pTokenServerProcess;
     TreeItemModel* m_pSidebarModel;
 
     // Playlist data cache
