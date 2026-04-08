@@ -3,10 +3,13 @@
 #include <QCoreApplication>
 #include <QEventLoop>
 #include <QStandardPaths>
+#include <QDir>
 #include <QThread>
 #include <QtDebug>
 
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 namespace mixxx {
 
@@ -64,9 +67,15 @@ AudioSource::OpenResult SoundSourceSpotify::tryOpen(
     // Look in common locations
     QString librespotPath;
     QStringList searchPaths = {
+#ifdef _WIN32
+            QDir::homePath() + QStringLiteral("/librespot/target/release/librespot.exe"),
+            QStringLiteral("C:/Users/jduar/librespot/target/release/librespot.exe"),
+            QCoreApplication::applicationDirPath() + QStringLiteral("/librespot.exe"),
+#else
             QDir::homePath() + QStringLiteral("/clawd/mixxx-spotify/librespot/target/release/librespot"),
             QStringLiteral("/usr/local/bin/librespot"),
             QStringLiteral("/usr/bin/librespot"),
+#endif
     };
     for (const auto& path : searchPaths) {
         if (QFile::exists(path)) {
@@ -147,18 +156,12 @@ void SoundSourceSpotify::close() {
 }
 
 void SoundSourceSpotify::readerThreadFunc() {
-    const int fifoFd = m_pProcess->fifoFd();
-    if (fifoFd < 0) {
-        qWarning() << "SoundSourceSpotify: Invalid FIFO fd";
-        return;
-    }
-
-    // Buffer for reading from FIFO
+    // Buffer for reading from pipe
     // Read in chunks of 4096 frames (4096 * 2 channels * 4 bytes = 32KB)
     constexpr int kReadFrames = 4096;
     constexpr int kReadSamples = kReadFrames * kChannelCount;
     constexpr int kReadBytes = kReadSamples * sizeof(float);
-    std::vector<float> readBuf(kReadSamples);
+    std::vector<char> readBuf(kReadBytes);
 
     while (m_readerRunning) {
         // Calculate available space in ring buffer
@@ -174,27 +177,29 @@ void SoundSourceSpotify::readerThreadFunc() {
             continue;
         }
 
-        ssize_t bytesRead = ::read(fifoFd, readBuf.data(), kReadBytes);
-        if (bytesRead <= 0) {
-            if (bytesRead == 0) {
-                // EOF — librespot might have stopped
-                QThread::msleep(50);
-                continue;
-            }
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                QThread::msleep(5);
-                continue;
-            }
-            qWarning() << "SoundSourceSpotify: FIFO read error:" << strerror(errno);
+        // Wait for data to be available
+        if (!m_pProcess->waitForAudioData(50)) {
+            continue;
+        }
+
+        qint64 bytesRead = m_pProcess->readAudioData(readBuf.data(), kReadBytes);
+        if (bytesRead < 0) {
+            qWarning() << "SoundSourceSpotify: Pipe read error";
             break;
+        }
+        if (bytesRead == 0) {
+            // No data available yet
+            QThread::msleep(5);
+            continue;
         }
 
         // Write the read samples into the ring buffer
         int samplesRead = static_cast<int>(bytesRead / sizeof(float));
+        const float* floatBuf = reinterpret_cast<const float*>(readBuf.data());
         SINT wp = writePos % totalSamples;
 
         for (int i = 0; i < samplesRead; i++) {
-            m_ringBuffer[wp] = readBuf[i];
+            m_ringBuffer[wp] = floatBuf[i];
             wp = (wp + 1) % totalSamples;
         }
 

@@ -50,7 +50,7 @@ void SpotifyApiClient::ensureToken(std::function<void()> callback) {
 }
 
 void SpotifyApiClient::refreshToken() {
-    QNetworkRequest request(QUrl(kTokenServerUrl));
+    QNetworkRequest request{QUrl(kTokenServerUrl)};
     QNetworkReply* reply = m_pNetwork->get(request);
     connect(reply, &QNetworkReply::finished, this, [this, reply]() {
         onTokenReceived(reply);
@@ -370,3 +370,5 @@ void SpotifyApiClient::transferPlayback(const QString& deviceId, bool play) {
 }
 
 } // namespace mixxx
+
+#include "moc_spotifyapiclient.cpp"

@@ -1,10 +1,12 @@
 #include "spotify/spotifyfeature.h"
 
+#include <QCoreApplication>
 #include <QInputDialog>
 #include <QMessageBox>
 #include <QtDebug>
 
 #include "library/library.h"
+#include "library/treeitem.h"
 
 namespace mixxx {
 
@@ -43,9 +45,15 @@ SpotifyFeature::~SpotifyFeature() = default;
     // Check if token server is likely running (we can't block here to test)
     // Just check if librespot binary exists
     QStringList paths = {
+#ifdef _WIN32
+            QDir::homePath() + QStringLiteral("/librespot/target/release/librespot.exe"),
+            QStringLiteral("C:/Users/jduar/librespot/target/release/librespot.exe"),
+            QCoreApplication::applicationDirPath() + QStringLiteral("/librespot.exe"),
+#else
             QDir::homePath() + QStringLiteral("/clawd/mixxx-spotify/librespot/target/release/librespot"),
             QStringLiteral("/usr/local/bin/librespot"),
             QStringLiteral("/usr/bin/librespot"),
+#endif
     };
     for (const auto& path : paths) {
         if (QFile::exists(path)) {
@@ -255,3 +263,5 @@ void SpotifyFeature::onApiError(const QString& message) {
 }
 
 } // namespace mixxx
+
+#include "moc_spotifyfeature.cpp"

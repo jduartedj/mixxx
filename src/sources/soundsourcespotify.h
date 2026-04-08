@@ -12,7 +12,8 @@
 
 namespace mixxx {
 
-/// SoundSource that reads raw PCM audio from a librespot FIFO pipe.
+/// SoundSource that reads raw PCM audio from a librespot pipe.
+/// On Linux, reads from a FIFO. On Windows, reads from process stdout.
 /// This bridges Spotify streaming into Mixxx's audio engine.
 class SoundSourceSpotify final : public SoundSource {
   public:
@@ -30,7 +31,7 @@ class SoundSourceSpotify final : public SoundSource {
             OpenMode mode,
             const OpenParams& params) override;
 
-    /// Read PCM data from the FIFO into the ring buffer.
+    /// Read PCM data from the pipe into the ring buffer.
     /// Called from the reader thread.
     void readerThreadFunc();
 
@@ -43,7 +44,7 @@ class SoundSourceSpotify final : public SoundSource {
     // Spotify API client for playback control
     std::unique_ptr<SpotifyApiClient> m_pApiClient;
 
-    // Ring buffer for PCM data from FIFO
+    // Ring buffer for PCM data from pipe
     static constexpr int kRingBufferFrames = 44100 * 30; // 30 seconds buffer
     static constexpr int kChannelCount = 2;
     SampleBuffer m_ringBuffer;
