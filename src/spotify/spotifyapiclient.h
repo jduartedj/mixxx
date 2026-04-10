@@ -54,6 +54,11 @@ class SpotifyApiClient : public QObject {
         return !m_accessToken.isEmpty();
     }
 
+    /// @return the access token for API calls (for download operations)
+    QString getAccessToken() const {
+        return m_accessToken;
+    }
+
     /// Convert Spotify key/mode to Camelot notation
     static QString toCamelotKey(int key, int mode);
 

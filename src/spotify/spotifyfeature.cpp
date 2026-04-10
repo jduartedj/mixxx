@@ -785,9 +785,7 @@ QString SpotifyFeature::downloadSpotifyTrack(const QString& trackId,
     }
 
     // Get access token from API client
-    // TODO: Enhance SpotifyApiClient to expose the access token
-    // For now, download will fail, but the structure is in place
-    QString accessToken;  // Will be obtained from m_pApiClient when we add accessor
+    QString accessToken = m_pApiClient->getAccessToken();
 
     if (accessToken.isEmpty()) {
         qWarning() << "SpotifyFeature: No access token available";
