@@ -2816,7 +2816,6 @@ if(SPOTIFY)
   target_sources(
     mixxx-lib
     PRIVATE
-      src/sources/soundsourcespotify.cpp
       src/spotify/spotifyprocess.cpp
       src/spotify/spotifyapiclient.cpp
       src/spotify/spotifyfeature.cpp

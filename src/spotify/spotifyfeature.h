@@ -3,6 +3,7 @@
 #include "library/baseexternallibraryfeature.h"
 #include "library/treeitemmodel.h"
 #include "spotify/spotifyapiclient.h"
+#include "spotify/spotifyprocess.h"
 
 #include <QAction>
 #include <QJsonArray>
@@ -20,7 +21,7 @@ namespace mixxx {
 
 /// Library feature that provides Spotify browsing in the Mixxx sidebar.
 /// Shows playlists, saved tracks, and search functionality.
-/// Uses Mixxx's standard library table infrastructure (SQL-backed models).
+/// Downloads tracks as WAV files via librespot and stores them in the cache.
 class SpotifyFeature : public BaseExternalLibraryFeature {
     Q_OBJECT
 
@@ -35,6 +36,21 @@ class SpotifyFeature : public BaseExternalLibraryFeature {
 
     /// Check if Spotify integration is available
     static bool isSupported();
+
+    /// Get the cache directory for Spotify track downloads
+    static QString getSpotifyTracksDir();
+
+    /// Download a Spotify track as a WAV file (blocking).
+    /// @return Path to WAV file, or empty string on failure
+    QString downloadSpotifyTrack(const QString& trackId,
+                                 const QString& trackUri,
+                                 int durationMs);
+
+    /// Check if a track is already downloaded
+    bool isTrackDownloaded(const QString& trackId) const;
+
+    /// Get the WAV path for a track
+    QString trackWavPath(const QString& trackId) const;
 
   public slots:
     void activate() override;
@@ -66,6 +82,7 @@ class SpotifyFeature : public BaseExternalLibraryFeature {
     void updateAudioFeaturesInDb(const QJsonArray& features);
 
     std::unique_ptr<SpotifyApiClient> m_pApiClient;
+    std::unique_ptr<SpotifyProcess> m_pDownloader;  // For downloading tracks
     QProcess* m_pTokenServerProcess;
     TreeItemModel* m_pSidebarModel;
 
@@ -78,6 +95,8 @@ class SpotifyFeature : public BaseExternalLibraryFeature {
     QJsonArray m_playlists;
     QJsonArray m_currentTracks;
     QMap<QString, QJsonObject> m_audioFeaturesCache; // trackId → features
+    QMap<QString, QString> m_trackUriCache;  // trackId → spotify:track:URI
+    QMap<QString, int> m_trackDurationCache;  // trackId → durationMs
 
     // Track the currently active playlist (or -1 for "all tracks")
     int m_currentPlaylistId;

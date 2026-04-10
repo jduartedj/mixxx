@@ -31,6 +31,7 @@ const QString SpotifyFeature::kSpotifyPlaylistTracksTable = QStringLiteral("spot
 SpotifyFeature::SpotifyFeature(Library* pLibrary, UserSettingsPointer pConfig)
         : BaseExternalLibraryFeature(pLibrary, pConfig, QStringLiteral("spotify")),
           m_pApiClient(std::make_unique<SpotifyApiClient>()),
+          m_pDownloader(nullptr),
           m_pTokenServerProcess(nullptr),
           m_pSidebarModel(nullptr),
           m_pTrackModel(nullptr),
@@ -577,7 +578,15 @@ void SpotifyFeature::insertTracksIntoDb(const QJsonArray& tracks) {
                                 .value(QStringLiteral("name"))
                                 .toString();
         int durationMs = obj.value(QStringLiteral("duration_ms")).toInt();
+        QString trackId = obj.value(QStringLiteral("id")).toString();
         QString uri = obj.value(QStringLiteral("uri")).toString();
+
+        // Cache track URI and duration for later download
+        m_trackUriCache[trackId] = uri;
+        m_trackDurationCache[trackId] = durationMs;
+
+        // Use placeholder WAV path as location (download on first load)
+        QString wavPath = trackWavPath(trackId);
 
         query.bindValue(":artist", artist);
         query.bindValue(":title", title);
@@ -585,7 +594,7 @@ void SpotifyFeature::insertTracksIntoDb(const QJsonArray& tracks) {
         query.bindValue(":year", 0);
         query.bindValue(":genre", QString());
         query.bindValue(":tracknumber", QString());
-        query.bindValue(":location", uri);
+        query.bindValue(":location", wavPath);
         query.bindValue(":comment", QString());
         query.bindValue(":duration", durationMs / 1000); // Convert to seconds
         query.bindValue(":bitrate", QString());
@@ -709,7 +718,93 @@ void SpotifyFeature::updateAudioFeaturesInDb(const QJsonArray& features) {
             }
         }
     }
+QString SpotifyFeature::getSpotifyTracksDir() {
+    QString tracksDir = QStandardPaths::writableLocation(
+                    QStandardPaths::GenericCacheLocation) +
+            QStringLiteral("/mixxx/spotify_tracks");
+    QDir().mkpath(tracksDir);
+    return tracksDir;
 }
+
+bool SpotifyFeature::isTrackDownloaded(const QString& trackId) const {
+    return QFile::exists(trackWavPath(trackId));
+}
+
+QString SpotifyFeature::trackWavPath(const QString& trackId) const {
+    return getSpotifyTracksDir() + QStringLiteral("/") + trackId + QStringLiteral(".wav");
+}
+
+QString SpotifyFeature::downloadSpotifyTrack(const QString& trackId,
+                                             const QString& trackUri,
+                                             int durationMs) {
+    QString wavPath = trackWavPath(trackId);
+
+    // Already downloaded?
+    if (QFile::exists(wavPath)) {
+        qDebug() << "SpotifyFeature: Track already cached:" << wavPath;
+        return wavPath;
+    }
+
+    qDebug() << "SpotifyFeature: Starting download of" << trackId;
+
+    // Ensure API client is authenticated
+    if (!m_pApiClient->isAuthenticated()) {
+        qWarning() << "SpotifyFeature: Not authenticated, cannot download";
+        return QString();
+    }
+
+    // Create downloader if needed
+    if (!m_pDownloader) {
+        // Find librespot path
+        QStringList librespotPaths = {
+#ifdef _WIN32
+                QDir::homePath() + QStringLiteral("/librespot/target/release/librespot.exe"),
+                QStringLiteral("C:/Users/jduar/librespot/target/release/librespot.exe"),
+                QCoreApplication::applicationDirPath() + QStringLiteral("/librespot.exe"),
+#else
+                QDir::homePath() + QStringLiteral("/clawd/mixxx-spotify/librespot/target/release/librespot"),
+                QStringLiteral("/usr/local/bin/librespot"),
+                QStringLiteral("/usr/bin/librespot"),
+#endif
+        };
+
+        QString librespotPath;
+        for (const auto& path : librespotPaths) {
+            if (QFile::exists(path)) {
+                librespotPath = path;
+                break;
+            }
+        }
+
+        if (librespotPath.isEmpty()) {
+            qWarning() << "SpotifyFeature: librespot binary not found";
+            return QString();
+        }
+
+        m_pDownloader = std::make_unique<SpotifyProcess>(librespotPath, 0);
+    }
+
+    // Get access token from API client
+    // TODO: Enhance SpotifyApiClient to expose the access token
+    // For now, download will fail, but the structure is in place
+    QString accessToken;  // Will be obtained from m_pApiClient when we add accessor
+
+    if (accessToken.isEmpty()) {
+        qWarning() << "SpotifyFeature: No access token available";
+        return QString();
+    }
+
+    // Download the track
+    if (!m_pDownloader->downloadTrack(trackUri, wavPath, durationMs, accessToken)) {
+        qWarning() << "SpotifyFeature: Download failed for" << trackId;
+        return QString();
+    }
+
+    qDebug() << "SpotifyFeature: Downloaded track:" << wavPath;
+    return wavPath;
+}
+
+
 
 } // namespace mixxx
 
