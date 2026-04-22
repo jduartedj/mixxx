@@ -142,11 +142,13 @@ void SpotifyApiClient::fetchPlaylists(int offset, int limit) {
 }
 
 void SpotifyApiClient::fetchPlaylistTracks(const QString& playlistId, int offset, int limit) {
-    ensureToken([this, playlistId, offset, limit]() {
-        QString endpoint = QStringLiteral("/playlists/%1/tracks?offset=%2&limit=%3")
-                                   .arg(playlistId)
-                                   .arg(offset)
-                                   .arg(limit);
+    Q_UNUSED(offset)
+    Q_UNUSED(limit)
+    ensureToken([this, playlistId]() {
+        // Use /playlists/{id} instead of /playlists/{id}/tracks
+        // because the /tracks sub-endpoint returns 403 in Spotify dev mode
+        QString endpoint = QStringLiteral("/playlists/%1")
+                                   .arg(playlistId);
         QNetworkReply* reply = makeRequest(endpoint);
         if (!reply) {
             return;
@@ -158,7 +160,11 @@ void SpotifyApiClient::fetchPlaylistTracks(const QString& playlistId, int offset
                 return;
             }
             QJsonDocument doc = QJsonDocument::fromJson(reply->readAll());
-            QJsonArray items = doc.object().value(QStringLiteral("items")).toArray();
+            QJsonObject playlist = doc.object();
+            QJsonArray items = playlist.value(QStringLiteral("tracks"))
+                                       .toObject()
+                                       .value(QStringLiteral("items"))
+                                       .toArray();
             // Extract the track objects from the wrapper
             QJsonArray tracks;
             for (const auto& item : items) {

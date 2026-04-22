@@ -227,17 +227,24 @@ void SpotifyFeature::activateChild(const QModelIndex& index) {
             emit showTrackModel(m_pTrackModel);
         }
     } else {
-        // It's a playlist name — find it and load tracks
+        // It's a playlist — strip " (count)" suffix added by onPlaylistsReceived
+        QString playlistName = itemName;
+        int parenIdx = itemName.lastIndexOf(QStringLiteral(" ("));
+        if (parenIdx > 0) {
+            playlistName = itemName.left(parenIdx);
+        }
+
+        int dbPlaylistId = m_playlistDbIds.value(playlistName, -1);
+        if (dbPlaylistId > 0) {
+            m_currentPlaylistId = dbPlaylistId;
+            m_pPlaylistModel->setPlaylistById(dbPlaylistId);
+            emit showTrackModel(m_pPlaylistModel);
+        }
+
         for (const auto& pl : m_playlists) {
             QJsonObject obj = pl.toObject();
-            if (obj.value(QStringLiteral("name")).toString() == itemName) {
+            if (obj.value(QStringLiteral("name")).toString() == playlistName) {
                 QString playlistId = obj.value(QStringLiteral("id")).toString();
-                int dbPlaylistId = m_playlistDbIds.value(itemName, -1);
-                if (dbPlaylistId > 0) {
-                    m_currentPlaylistId = dbPlaylistId;
-                    m_pPlaylistModel->setPlaylistById(dbPlaylistId);
-                    emit showTrackModel(m_pPlaylistModel);
-                }
                 m_pApiClient->fetchPlaylistTracks(playlistId);
                 break;
             }
@@ -559,7 +566,6 @@ void SpotifyFeature::insertTracksIntoDb(const QJsonArray& tracks) {
             "VALUES (:artist, :title, :album, :year, :genre, :tracknumber, "
             ":location, :comment, :duration, :bitrate, :bpm, :key, :rating)");
 
-    int trackId = 1;
     for (const auto& track : tracks) {
         QJsonObject obj = track.toObject();
 
@@ -578,15 +584,15 @@ void SpotifyFeature::insertTracksIntoDb(const QJsonArray& tracks) {
                                 .value(QStringLiteral("name"))
                                 .toString();
         int durationMs = obj.value(QStringLiteral("duration_ms")).toInt();
-        QString trackId = obj.value(QStringLiteral("id")).toString();
+        QString spotifyId = obj.value(QStringLiteral("id")).toString();
         QString uri = obj.value(QStringLiteral("uri")).toString();
 
         // Cache track URI and duration for later download
-        m_trackUriCache[trackId] = uri;
-        m_trackDurationCache[trackId] = durationMs;
+        m_trackUriCache[spotifyId] = uri;
+        m_trackDurationCache[spotifyId] = durationMs;
 
         // Use placeholder WAV path as location (download on first load)
-        QString wavPath = trackWavPath(trackId);
+        QString wavPath = trackWavPath(spotifyId);
 
         query.bindValue(":artist", artist);
         query.bindValue(":title", title);
@@ -606,7 +612,11 @@ void SpotifyFeature::insertTracksIntoDb(const QJsonArray& tracks) {
             LOG_FAILED_QUERY(query);
             qWarning() << "SpotifyFeature: Failed to insert track:" << title;
         }
-        trackId++;
+    }
+
+    // If we're inside a playlist context, link the tracks to that playlist
+    if (m_currentPlaylistId > 0) {
+        insertPlaylistTracksIntoDb(m_currentPlaylistId, tracks);
     }
 
     qDebug() << "SpotifyFeature: Inserted" << tracks.size() << "tracks into database";
@@ -638,19 +648,19 @@ void SpotifyFeature::insertPlaylistTracksIntoDb(int playlistId, const QJsonArray
             " (playlist_id, track_id, position) "
             "VALUES (:playlist_id, :track_id, :position)");
 
-    // First, get the track IDs from the library table by matching artist + title
     QSqlQuery selectQuery(database);
 
     int position = 0;
     for (const auto& track : tracks) {
         QJsonObject obj = track.toObject();
-        QString uri = obj.value(QStringLiteral("uri")).toString();
+        QString spotifyId = obj.value(QStringLiteral("id")).toString();
 
-        // Find the track ID by URI
+        // Look up by WAV path (matches what insertTracksIntoDb stored)
+        QString wavPath = trackWavPath(spotifyId);
         selectQuery.prepare(
                 "SELECT id FROM " + kSpotifyLibraryTable +
                 " WHERE location = :location");
-        selectQuery.bindValue(":location", uri);
+        selectQuery.bindValue(":location", wavPath);
 
         if (!selectQuery.exec()) {
             LOG_FAILED_QUERY(selectQuery);
@@ -658,10 +668,10 @@ void SpotifyFeature::insertPlaylistTracksIntoDb(int playlistId, const QJsonArray
         }
 
         if (selectQuery.next()) {
-            int trackId = selectQuery.value(0).toInt();
+            int trackDbId = selectQuery.value(0).toInt();
 
             query.bindValue(":playlist_id", playlistId);
-            query.bindValue(":track_id", trackId);
+            query.bindValue(":track_id", trackDbId);
             query.bindValue(":position", position);
 
             if (!query.exec()) {
@@ -671,8 +681,8 @@ void SpotifyFeature::insertPlaylistTracksIntoDb(int playlistId, const QJsonArray
         }
     }
 
-    qDebug() << "SpotifyFeature: Inserted" << tracks.size()
-             << "playlist tracks into database";
+    qDebug() << "SpotifyFeature: Inserted" << position
+             << "playlist tracks into database (of" << tracks.size() << "total)";
 }
 
 void SpotifyFeature::updateAudioFeaturesInDb(const QJsonArray& features) {
@@ -695,27 +705,15 @@ void SpotifyFeature::updateAudioFeaturesInDb(const QJsonArray& features) {
         int mode = obj.value(QStringLiteral("mode")).toInt(-1);
         QString camelot = SpotifyApiClient::toCamelotKey(key, mode);
 
-        // Find track by ID and update BPM/key
-        QSqlQuery findQuery(database);
-        findQuery.prepare(
-                "SELECT location FROM " + kSpotifyLibraryTable +
-                " WHERE location LIKE :id");
-        findQuery.bindValue(":id", "%:track:" + id);
+        // Location is the WAV path: .../spotify_tracks/<id>.wav
+        QString wavPath = trackWavPath(id);
 
-        if (!findQuery.exec()) {
-            continue;
-        }
+        query.bindValue(":bpm", tempo);
+        query.bindValue(":key", camelot);
+        query.bindValue(":location", wavPath);
 
-        while (findQuery.next()) {
-            QString location = findQuery.value(0).toString();
-
-            query.bindValue(":bpm", tempo);
-            query.bindValue(":key", camelot);
-            query.bindValue(":location", location);
-
-            if (!query.exec()) {
-                LOG_FAILED_QUERY(query);
-            }
+        if (!query.exec()) {
+            LOG_FAILED_QUERY(query);
         }
     }
 QString SpotifyFeature::getSpotifyTracksDir() {
